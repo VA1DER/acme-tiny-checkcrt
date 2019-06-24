@@ -1,0 +1,253 @@
+#!/bin/bash
+#
+# checkcrt version 1.2
+#
+# Check to see if a server certificate is expiring within a preset time.
+# If it is expiring, then try and renew it with acme_tiny.py.
+#
+# This can be placed in a crontab and run daily. It will only try and replace
+# the certificate once it is within the renewal period, but since it is being
+# run daily it will try again the next day if the certificate renewal fails.
+# On either success or failure the contact is emailed.
+#
+# Instructions at the end of script.  Please read them before using.
+#
+# Copyright ©2019 by Kurt Fitzner (kurt@va1der.ca)
+# Released under the GNU GPL v3 license (https://www.gnu.org/licenses/gpl-3.0.en.html)
+
+# Change this to a 1 AFTER you have read the instructions and configured the scriot
+CONFIGURED=0
+
+# Prefix for the various certificate combos we need to make.  All files will have this set
+CRTPREFIX=cooldomain_org
+
+# Directories - tailor this to your setup.
+BINDIR=/usr/local/bin                 # Location of acme_tiny.py script
+ETCDIR=/usr/local/etc/acme            # Location of acme_account.key (readable by ACMEUSER)
+WORKDIR=/usr/local/etc/acme/work      # Working dir where certificate is first saved (dir read/writable by ACMEUSER)
+PUBDIR=/etc/ssl/certs                 # Directory where certificates are published
+#PRIVDIR=/etc/ssl/private             # Directory where private certificate/key combo saved - SEE INSTRUCTIONS *** (bottom of file)
+ACMEDIR=/var/www/html/acme            # Directory set up for HTTP challenge response
+
+# Read the explanation for PRIVDIR in the instructions.
+
+# Contact for ACME account, and also will be used to email for notification of success or failure from this script
+CONTACT=keymaster@cooldomain.org
+
+# Email signature - because even an automated email from your server needs some style
+EMAILSIG="Nunquam titillandus valet libellum"
+
+# Set REMAINTIME to the length of time (in seconds) that can be remaining on a certiicate before it is renewed.
+REMAINTIME=$(( 86400 * 10 )) # 10 days
+
+# Services to restart when the key is successfully renewed
+SERVICES="postfix dovecot lighttpd prosody"
+
+# Unprivileged user to run acme_tiny.py with
+# This user (or its group) must have read access to $ETCDIR/acme_account.key and write access to $WORKDIR/$CRTPREFIX.newcrt
+ACMEUSER=ssl-cert
+
+# Main function - check to see if the certificate needs replacing
+main() {
+  # Check our options, currently only -f for force, and -h for help.
+  while getopts ":fh" switch; do
+    case ${switch} in
+      f)
+        # The -f option forces a certificate update regardless of the old certificate's expiry date
+        FORCEUPDATE=1
+        ;;
+      h)
+        # The -h option just prints the usage then exits.
+        usage
+        exit 1
+        ;;
+      *)
+        # Any unexpected option will also just print the usage then exit.
+        usage
+        exit 1;
+    esac
+  done
+
+  # If the script hasn't been configured, then also just print the usage and exit, with a little extra message
+  if (( CONFIGURED != CONFIGVALUE )); then
+    usage
+    exit 1
+  fi
+
+  # Get today's date and the expiry date from the certificate
+  NOW=`date +%s`
+  EXPIREDATE=`openssl x509 -noout -enddate < $PUBDIR/$CRTPREFIX.crt | sed s/notAfter=//`
+  EXPIRE=`date +%s -ud "$EXPIREDATE"`
+  # Check that either the time to expire is less than REMAINTIME in the future, or that we are forcing an update - if either then try and renew
+  if (( ( EXPIRE - NOW ) < REMAINTIME )) || (( FORCEUPDATE == 1 )); then
+    replace_certificate
+  fi
+}
+
+# replace_certificate - this does most of the actual work in replacing the certificate
+replace_certificate() {
+
+  # Zeroize the output from the previous run of acme_tiny.py
+  cat /dev/null > $WORKDIR/$CRTPREFIX.newcrt1
+  cat /dev/null > $WORKDIR/$CRTPREFIX.newcrt2
+  # The first if here is a testing version.  If just takes the existing chained certificate (certificate + intermediate) and splits it in two as if it was just received.
+  # You can use this when you are testing your permissions to make sure everything works without actually going to the LetsEncrypt server. To do that uncomment it and
+  # then comment out lines 96, 97, and 98.
+  #if sudo -u $ACMEUSER bash -c "set -o pipefail;cat $PUBDIR/$CRTPREFIX\"_chain.pem\" | awk '/-----BEGIN CERTIFICATE-----/{x=\"$WORKDIR/$CRTPREFIX.newcrt\"++i;}{print > x;}'" && [ -s $WORKDIR/$CRTPREFIX.newcrt1 ]; then
+  #
+  # Drop root privileges and run acme_tine.py, split the output into two individual certificates, and check to make sure that both of them have something in them
+  # TODO: Actually check to make sure they are valid certificates and that our signed certificate has an expiry further in the future than our current one.
+  if sudo -u $ACMEUSER bash -c "set -o pipefail;$BINDIR/acme_tiny.py --account-key $ETCDIR/acme_account.key --csr $WORKDIR/$CRTPREFIX.csr --acme-dir $ACMEDIR/ \
+   --contact mailto:$CONTACT 2> $WORKDIR/$CRTPREFIX.log | awk '/-----BEGIN CERTIFICATE-----/{x=\"$WORKDIR/$CRTPREFIX.newcrt\"++i;}{print > x;}'" \
+   && [ -s $WORKDIR/$CRTPREFIX.newcrt1 ] && [ -s $WORKDIR/$CRTPREFIX.newcrt2 ]; then
+    # The above should leave us with the newly signed certificate as $CRTPREFIX.newcrt1 and the CA's intermediate "root" as $CRTPREFIX.newcrt2
+    sudo -u $ACMEUSER touch $WORKDIR/$CRTPREFIX.log # Make sure the log file at least exists
+    # Assemble the various certificate chains and combinations we might need
+    # All certificate files are first assembled in $WORKDIR.  This is so that you always have a backup copy of what is published.
+    cat $WORKDIR/$CRTPREFIX.newcrt1 > $WORKDIR/$CRTPREFIX.crt                                      # Signed certificate by itself
+    cat $WORKDIR/$CRTPREFIX.newcrt2 > $WORKDIR/$CRTPREFIX"_caroot.pem"                             # CA's intermediate certificate by itself
+    cat $WORKDIR/$CRTPREFIX.newcrt1 $WORKDIR/$CRTPREFIX.newcrt2 > $WORKDIR/$CRTPREFIX"_chain.pem"  # Signed certificate chained with intermediate
+    #cat $WORKDIR/$CRTPREFIX.newcrt1 $WORKDIR/$CRTPREFIX.key > $WORKDIR/$CRTPREFIX.pem              # Signed cerficicate together with private key - SEE INSTRUCTIONS ***
+    # Next, assemble them in their final locations
+    cat $WORKDIR/$CRTPREFIX.newcrt1 > $PUBDIR/$CRTPREFIX.crt                                       # Signed certificate by itself
+    cat $WORKDIR/$CRTPREFIX.newcrt2 > $PUBDIR/$CRTPREFIX"_caroot.pem"                              # CA's intermediate certificate by itself
+    cat $WORKDIR/$CRTPREFIX.newcrt1 $WORKDIR/$CRTPREFIX.newcrt2 > $PUBDIR/$CRTPREFIX"_chain.pem"   # Signed certificate chained with intermediate
+    #cat $WORKDIR/$CRTPREFIX.newcrt1 $WORKDIR/$CRTPREFIX.key > $PRIVDIR/$CRTPREFIX.pem              # Signed certificate together with private key - SEE INSTRUCTIONS ***
+    # Restart the required services, log any output for review
+    for SERVICE in $SERVICES; do service $SERVICE restart >> $WORKDIR/$CRTPREFIX.log 2>> $WORKDIR/$CRTPREFIX.log; done
+    # Email the success message to $CONTACT, including the log so it can be reviewed
+    {
+      echo The server''s TLS certificate has been renewed and all dependent services restarted.  All indications are that this has completed succesfully, however reviewing the log would be prudent.  The log follows.
+      echo 
+      echo Yours faithfully,
+      echo "     "`hostname -s`" of "`hostname -d`
+      echo --
+      echo "$EMAILSIG"
+      echo 
+      echo Renewal log:
+      echo ------------
+    } | cat - $WORKDIR/$CRTPREFIX.log | mail -s "Certificate renewed on `hostname -d`" $CONTACT
+  else # Something went wrong, email the failure message to $CONTACT with the log.
+    # First make sure the log file exists, maybe things failed before writing the log
+    sudo -u $ACMEUSER touch $WORKDIR/$CRTPREFIX.log
+    {
+      echo Warning, renewal of the server certificate key has failed.  Another attempt will be made at this script''s next cron interval.  The failure log to follow.
+      echo 
+      echo Yours faithfully,
+      echo "     "`hostname -s`" of "`hostname -d`
+      echo --
+      echo "$EMAILSIG"
+      echo 
+      echo Failure log:
+      echo ------------
+    } | cat - $WORKDIR/$CRTPREFIX.log | mail -s "Certificate renewal failure on `hostname -d`" $CONTACT
+  fi
+} # replace_certificate()
+
+# Print out the usage, and maybe a little error message
+usage() {
+  if (( CONFIGURED == 0 )); then
+    echo
+    echo "checkcrt is not configured - read and edit the script to configure it."
+    echo
+  elif (( CONFIGURED != CONFIGVALUE )); then
+    echo
+    echo "You changed CONFIGURED but didn't actually read the instructions."
+    echo "GO BACK AND READ THE INSTRUCTIONS AT THE END OF THE SCRIPT."
+    echo
+  fi
+  echo "Usage:"
+  #echo
+  echo "checkcrt [-f] [-h]"
+  echo " -f - force certificate update regardless of the old certificate's expiry date"
+  echo " -h - help - display this usage message and exit"
+} # usage()
+
+#
+# INSTRUCTIONS
+#
+# This is a script to go along with the excellent little ACME certificate client acme_tiny.py.  It is intended to be placed in your
+# crontab and run daily.  The script will look at the certificate's expiry date and check how far in the future it is.  If you
+# are within the preset time to expiry, then the script will attempt to renew it.  In this way, don't have to run acme_tiny.py every
+# 60 days in cron and hope it succeeds.
+#
+# To operate this script you need:
+# - The acme_tiny.py script, of course, which is available at: https://github.com/diafygi/acme-tiny
+# - An unprivileged system user and group.  Debian-based ditros already have the group "ssl-cert", adding the user "ssl-cert"
+#   and making it a member of the "ssl-cert" group is probably a good way to go.
+#   Once you have this set up, set the script's ACMEUSER to this
+# - To pick a certificate filename prefix.  All the various certificate files will use this prefix.  Probably good to use your
+#   domain name here. This way you can use multiple versions of this script for multiple certificates that won't interfere.
+#   Set CRTPREFIX to this.
+# - The following directories need to exist and be configured in the script:
+#    BINDIR for the acme_tiny.py script - this directory needs to be accessible by ACMEUSER, defaults to /usr/local/bin
+#    ETCDIR for acme_account.key, your acme account private key.  ETCDIR needs to be accessible by ACMEUSER, and the
+#        acme_account.key file itself should be readable only by ACMEUSER.  Defaults to /usr/local/etc/acme
+#    WORKDIR this is where the certificate signing request is stored, and where various certificate files saved to.  The drectory
+#        should be writable by ACMEUSER or ACMEUSER's group.  It will hold the following files:
+#              Input files (only read by acme_tiny.py or by this script)
+#                CRTPREFIX.csr        readable by ACMEUSER, contains your server's certificate signing request
+#                CRTPREFIX.key        your server's private key, should only readable by root, and only needs to be in the directory
+#                                     if you require the CRTPREFIX.pem file noted below
+#              Files written directly by acme_tiny.py as ACMEUSER:
+#                CRTPREFIX.log        writeable by ACMEUSER, a log of the acme session
+#                CRTPREFIX.newcrt1    writeable by ACMEUSER, used to hold the incoming signed certificate
+#                CRTPREFIX.newcrt2    writeable by ACMEUSER, used to hold the incoming intermediate CA chaining certificate
+#              Files built from the above, consisting of certificates in the forms used by various server softare:
+#                CRTPREFIX.crt        a copy of the newly signed certificate by itself
+#                CRTOREFIX_caroot.crt a copy of the CA's intermediate certificate
+#                CRTPREFIX_chain.crt  a copy of the newly signed certificate and CA's intermediate chained
+#                CRTPREFIX.pem        a copy of the newly signed certificate plus your server's private key, this is only needed if
+#                                     you use lighttpd or some other software that required a certificate together with your private
+#                                     key.  Should only be readable by root.
+#    PUBDIR as the location of where public certificate filess will be published to.  Should be where your certificates
+#        normally go for your distro.  Defaults to /etc/ssl/certs
+#    PRIVDIR as the location of where private TLS server keys are stored.  It should be where your server key normally goes for
+#        your distro.  Defaults to /etc/ssl/private
+#        PRIVDIR is ONLY needed for the rare software that requires construction of a pem file that contains the signed certificate
+#        together with your private key.  To my knowledge, the only software that needs this is lighttpd 
+#    ACMEDIR as the HTTP challenge response directory set up to be writable by ACMEUSER, and configured with your web server as per
+#        the instructions with acme_tiny.py
+# - Configure the rest of the script.  Specifically REMAINTIME and SERVICES.  Especially the latter, because the script needs to
+#   have an accurate list of all services that need to be restarted when the certificate changes.
+#
+# *** If you run lighttpd or any other service that requires the public certificate together with the sever private key, then look at
+# all the lines in the script marked SEE INSTRUCTIONS *** and uncomment them as required.  You will need to ensure that CRTPREFIX.pem
+# is located in WORKDIR and only readable by root.  If you don't already know that you need this then you probably don't.
+#
+# Directory and file name and permissions example:
+# If your domain name were, say, cooldomain.org then this would be a reasonable directory and file name and permissions configuration:
+# BINDIR=/usr/local/bin
+# ETCDIR=/usr/local/etc/acme       (drwxr-xr-x root root)
+#   -r-------- ssl-cert ssl-cert acme_account.key
+# WORKDIR=/usr/local/etc/acme/work (drwx--x--- root ssl-cert)
+#   -rw-r--r-- root root     cooldomain_org.csr
+#   -rw------- root root     cooldomain_org.key
+#
+#   -rw-rw-r-- root ssl-cert cooldomain_org.log
+#   -rw-rw-r-- root ssl-cert cooldomain_org.newcrt1
+#   -rw-rw-r-- root ssl-cert cooldomain_org.newcrt2
+#
+#   -rw-r--r-- root root     cooldomain_org.crt
+#   -rw-r--r-- root root     cooldomain_org_caroot.crt
+#   -rw-r--r-- root root     cooldomain_org_chain.crt
+#   -rw------- root root     cooldomain_org.pem
+# PUBDIR=/etc/ssl/certs
+#   -rw-r--r-- root root     cooldomain_org.crt
+#   -rw-r--r-- root root     cooldomain_org_caroot.crt
+#   -rw-r--r-- root root     cooldomain_org_chain.crt
+# PRIVDIR=/etc/ssl/private         (drwx--x--- root ssl-cert)
+#   -rw------- root root     cooldomain_org.pem
+# ACMEDIR=/var/www/html/acme       (drwxrwx--- www-data ssl-cert)
+#
+# The best way to get this script working is to set up the directory and file structure in advance, and to get all your certificate
+# files manually built and in place according to the naming structure you intend to use with this script.  Configure all your services
+# to use the files according the naming scheme.  Do this before you ever test the script so that you can verify all your services are
+# working with the naming scheme.
+#
+# Once it is all configured, then ignore the instructions at the top and set CONFIGURED=42 to allow the script to run, and you can use
+# checkcrt -f to force getting a new certificate.
+
+CONFIGVALUE=42
+main "$@"
+exit 0
